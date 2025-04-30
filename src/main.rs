@@ -2,34 +2,35 @@ use eframe::egui;
 use rfd::FileDialog;
 use std::fs;
 use dirs;
-use rodio::{Decoder, OutputStream};
+use std::io::BufReader;
+use std::thread;
+use std::time::Duration;
+
 
 fn main() -> eframe::Result<()> {
+
+    let (_stream, handle) = rodio::OutputStream::try_default().unwrap();
+    let sink = rodio::Sink::try_new(&handle).unwrap();
+
+    let file = std::fs::File::open("/home/bkelldog/Coding/Typewriter/typewriter_click.wav").unwrap();
+    let click = handle.play_once(BufReader::new(file)).unwrap();
+    click.set_volume(0.9);
+    println!("Started click");
+
     let options = eframe::NativeOptions::default();
     eframe::run_native(
         "Typwriter",
         options,
-        Box::new(|_cc| {
-            let (stream, stream_handle) = rodio::OutputStream::try_default().unwrap();
-            let sound_file = std::fs::read("../typewriter_click.wav").unwrap();  // Read the file bytes
+        Box::new(|_cc| Ok(Box::new(Typewriter::default()))),
+    );
 
-            Ok(Box::new(Typewriter {
-                text: String::new(),
-                file_path: None,
-                last_key: None,
-                audio_sink: stream_handle, // Initialize the audio_sink with stream_handle
-                sound_bytes: sound_file,  // Store the sound bytes from the file
-            }))
-        })
-    )
+    Ok(())
 }
 
 struct Typewriter {
     text: String,
     file_path: Option<std::path::PathBuf>,
     last_key: Option<egui::Key>,
-    audio_sink: rodio::OutputStreamHandle,
-    sound_bytes: Vec<u8>,
 }
 
 impl Default for Typewriter {
@@ -51,11 +52,6 @@ impl eframe::App for Typewriter {
             if ctx.input(|i| i.key_pressed(*key)) {
                 self.last_key = Some(*key);
                 println!("Key pressed: {:?}", *key);
-
-                let cursor = std::io::Cursor::new(self.sound_bytes.clone());
-                if let Ok(decoder) = rodio::Decoder::new(cursor) {
-                    let _ = self.audio_sink.play_raw(decoder.decode_raw().unwrap());
-                }
             }
         }
         
