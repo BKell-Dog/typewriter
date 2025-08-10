@@ -1,23 +1,19 @@
-# typewriter_mvp.py  (updated)
-# Features changed:
-# - plays typewriter_strike.wav for each keystroke if present in same folder
-# - carriage remains visually centered; page content translates horizontally instead
+# typewriter_mvp_blocky_keydown_draw_keyup_move.py
+# Printable characters are drawn & struck on KEYDOWN; horizontal blocky page move and column advance occur on KEYUP.
 
 import pygame
 import random
 import sys
 import os
+import tkinter as tk
+from tkinter import filedialog
 
-# optional heavy math/sound synth (kept as fallback)
+# optional numpy sound synth fallback
 try:
     import numpy as np
     HAS_NUMPY = True
 except Exception:
     HAS_NUMPY = False
-
-# tkinter for file dialogs
-import tkinter as tk
-from tkinter import filedialog
 
 pygame.init()
 try:
@@ -30,7 +26,7 @@ pygame.key.set_repeat(0)
 # ---------- window / paper constants ----------
 W, H = 1000, 780
 screen = pygame.display.set_mode((W, H))
-pygame.display.set_caption("Typewriter — Commands (updated)")
+pygame.display.set_caption("Typewriter — Draw on KeyDown, Move on KeyUp")
 clock = pygame.time.Clock()
 
 # paper area (leave room for command bar at bottom)
@@ -60,12 +56,10 @@ cursor_row = 0            # absolute row index
 paper_scroll = 0          # how many rows scrolled off top
 paper_scroll_offset_px = 0.0  # during vertical animation
 
-# Instead of moving carriage_px, we move the page horizontally by view_offset_px (pixels).
-# Glyph drawing x = PAPER_X + LEFT_MARGIN + g['col']*CHAR_WIDTH + view_offset_px + g['offset_x']
-# We choose initial view_offset_px so that the initial cursor_col appears centered.
+# view_offset_px represents the paper's horizontal translation: paper is drawn at PAPER_X + view_offset_px
 view_offset_px = 0.0
 
-glyphs = []  # {'char','row','col','offset_x','offset_y','darkness'}
+glyphs = []  # list of dicts: {'char','row','col','offset_x','offset_y','darkness', 'pending':bool}
 
 # pages history
 saved_pages = []
@@ -74,6 +68,7 @@ saved_pages = []
 key_locked = False
 locked_key = None
 locked_char_display = ""
+pending_keydown = None   # store the pygame.Event for the keydown that is pending (strike on KEYDOWN, move on KEYUP)
 animating = False
 animation_cancel = False
 
@@ -91,6 +86,10 @@ THUNK_VOL = 0.9
 # small UI font
 ui_font = pygame.font.SysFont(FONT_NAME, 16)
 
+# how many spaces for a tab if you want to expand tabs (optional, we map tabs -> single space for simplicity)
+TAB_SIZE = 4
+
+
 # modifier keys that should NOT lock (so Shift works)
 MODIFIER_KEYS = {
     pygame.K_LSHIFT, pygame.K_RSHIFT,
@@ -102,7 +101,6 @@ MODIFIER_KEYS = {
 MODIFIER_KEYS = {k for k in MODIFIER_KEYS if k is not None}
 
 # ---------- sound setup ----------
-# try to load typewriter_strike.wav from same directory as this script
 strike_sound = None
 try:
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -116,7 +114,6 @@ if os.path.isfile(strike_path):
         print("Failed to load typewriter_click.wav:", e)
         strike_sound = None
 
-# fallback synthesized sounds (used if strike_sound is None)
 def _make_click_sound():
     if not HAS_NUMPY:
         return None
@@ -161,7 +158,6 @@ def _make_thunk_sound():
     except Exception:
         return None
 
-# create fallback sounds
 click_fallback = _make_click_sound()
 bell_sound = _make_bell_sound()
 thunk_sound = _make_thunk_sound()
@@ -175,9 +171,7 @@ def play_key():
             strike_sound.play()
             return
         except Exception:
-            # fallthrough to fallback
             pass
-    # fallback
     if click_fallback:
         try:
             click_fallback.set_volume(KEY_VOL)
@@ -193,7 +187,6 @@ def play_bell():
             return
         except Exception:
             pass
-    # fallback: play key
     play_key()
 
 def play_thunk():
@@ -204,7 +197,6 @@ def play_thunk():
             return
         except Exception:
             pass
-    # fallback: two clicks
     play_key()
     pygame.time.delay(30)
     play_key()
@@ -214,20 +206,77 @@ def count_strikes_at(row, col):
     return sum(1 for g in glyphs if g['row'] == row and g['col'] == col)
 
 def pixel_for_col(col_index):
-    """Pixel position for a column in the *unshifted* page coordinates.
-    This is used only conceptually; actual drawing uses view_offset_px."""
-    return PAPER_X + LEFT_MARGIN + col_index * CHAR_WIDTH
+    # column pixel position relative to the paper origin
+    return LEFT_MARGIN + col_index * CHAR_WIDTH
 
-# ---------- animations (horizontal view offset & vertical scroll) ----------
-def animate_view_to_col(target_col, duration_ms=140, play_thunk_at_end=False, thunk_delay_ms=0):
-    """Animate view_offset_px so that target_col appears under the carriage display X."""
+# ---------- blocky/stepped view animation ----------
+def animate_view_to_col_blocky(target_col, steps=4, step_ms=10, play_thunk_at_end=False, thunk_delay_ms=0):
+    """
+    Blocky/stepped animation to move view_offset_px so that target_col aligns with the fixed carriage center.
+    steps: number of discrete jumps
+    step_ms: milliseconds pause per step
+    Buffer events while animating and repost them afterward.
+    """
     global animating, view_offset_px, animation_cancel
     animating = True
     animation_cancel = False
     local_buffer = []
 
-    # compute target view_offset: we want pixel_for_col(target_col) + view_offset_px == CARRIAGE_DISPLAY_X
-    target_offset = CARRIAGE_DISPLAY_X - (PAPER_X + LEFT_MARGIN) - target_col * CHAR_WIDTH
+    target_offset = CARRIAGE_DISPLAY_X - PAPER_X - pixel_for_col(target_col)
+    start_offset = view_offset_px
+    delta = target_offset - start_offset
+
+    for s in range(1, steps + 1):
+        if animation_cancel:
+            break
+        frac = s / steps
+        new_offset = start_offset + delta * frac
+        view_offset_px = new_offset
+
+        draw()
+        pygame.display.flip()
+
+        wait_until = pygame.time.get_ticks() + step_ms
+        while pygame.time.get_ticks() < wait_until:
+            for iev in pygame.event.get():
+                if iev.type == pygame.QUIT:
+                    animation_cancel = True
+                    pygame.event.post(iev)
+                else:
+                    local_buffer.append(iev)
+            clock.tick(120)
+
+    # ensure final position
+    if not animation_cancel:
+        view_offset_px = target_offset
+        draw()
+        pygame.display.flip()
+
+    if play_thunk_at_end and not animation_cancel:
+        if thunk_delay_ms:
+            pygame.time.delay(thunk_delay_ms)
+        play_thunk()
+
+    animating = False
+    animation_cancel = False
+
+    for ev in local_buffer:
+        try:
+            pygame.event.post(ev)
+        except Exception:
+            pass
+
+def animate_view_to_col_smooth(target_col, duration_ms=1000, play_thunk_at_end=False, thunk_delay_ms=0):
+    """
+    Smooth animation to move view_offset_px so that target_col aligns with the fixed carriage center.
+    Uses ease-out interpolation and buffers events while animating.
+    """
+    global animating, view_offset_px, animation_cancel
+    animating = True
+    animation_cancel = False
+    local_buffer = []
+
+    target_offset = CARRIAGE_DISPLAY_X - PAPER_X - pixel_for_col(target_col)
     start_offset = view_offset_px
     start_time = pygame.time.get_ticks()
     end_time = start_time + duration_ms
@@ -239,11 +288,13 @@ def animate_view_to_col(target_col, duration_ms=140, play_thunk_at_end=False, th
             draw()
             pygame.display.flip()
             break
+
         frac = (now - start_time) / max(1, (end_time - start_time))
-        frac = 1 - (1 - frac) * (1 - frac)  # ease-out
+        # ease-out
+        frac = 1 - (1 - frac) * (1 - frac)
         view_offset_px = start_offset + (target_offset - start_offset) * frac
 
-        # buffer events
+        # buffer events so UI remains responsive
         for iev in pygame.event.get():
             if iev.type == pygame.QUIT:
                 animation_cancel = True
@@ -255,7 +306,6 @@ def animate_view_to_col(target_col, duration_ms=140, play_thunk_at_end=False, th
         pygame.display.flip()
         clock.tick(60)
 
-    # optional thunk
     if play_thunk_at_end and not animation_cancel:
         if thunk_delay_ms:
             pygame.time.delay(thunk_delay_ms)
@@ -271,6 +321,7 @@ def animate_view_to_col(target_col, duration_ms=140, play_thunk_at_end=False, th
         except Exception:
             pass
 
+# Smooth vertical feed (unchanged)
 def animate_paper_scroll_to(target_scroll, duration_ms=260):
     global animating, paper_scroll, paper_scroll_offset_px, animation_cancel
     if target_scroll < 0:
@@ -331,25 +382,34 @@ button_rects = []
 
 def draw():
     screen.fill((30, 30, 30))
-    # paper rect
-    pygame.draw.rect(screen, PAPER_COLOR, (PAPER_X, PAPER_Y, PAPER_W, PAPER_H))
 
-    # ruled lines
+    # Draw paper rectangle shifted by view_offset_px
+    paper_draw_x = int(PAPER_X + view_offset_px)
+    pygame.draw.rect(screen, PAPER_COLOR, (paper_draw_x, PAPER_Y, PAPER_W, PAPER_H))
+
+    # ruled lines (shifted with paper)
     for i in range(visible_rows + 1):
         y = PAPER_Y + i * LINE_HEIGHT + paper_scroll_offset_px
+        x1 = paper_draw_x + 10
+        x2 = paper_draw_x + PAPER_W - 10
         if PAPER_Y <= y <= PAPER_Y + PAPER_H:
-            pygame.draw.line(screen, (230, 230, 220), (PAPER_X + 10, y), (PAPER_X + PAPER_W - 10, y), 1)
+            pygame.draw.line(screen, (230, 230, 220), (x1, y), (x2, y), 1)
 
-    # draw visible glyphs; compute x using view_offset_px so page shifts under fixed carriage
+    # draw visible glyphs; position relative to paper_draw_x + LEFT_MARGIN
     min_row = paper_scroll
     max_row = paper_scroll + visible_rows - 1
     for g in glyphs:
         if g['row'] < min_row or g['row'] > max_row:
             continue
-        x = PAPER_X + LEFT_MARGIN + g['col'] * CHAR_WIDTH + view_offset_px + g.get('offset_x', 0)
+
+        ch = g.get('char', '')
+        # Skip non-single-printable characters
+        if not (isinstance(ch, str) and len(ch) == 1 and (ch == ' ' or ch.isprintable())):
+            continue
+
+        x = paper_draw_x + LEFT_MARGIN + g['col'] * CHAR_WIDTH + g.get('offset_x', 0)
         y = PAPER_Y + (g['row'] - paper_scroll) * LINE_HEIGHT + g.get('offset_y', 0) + paper_scroll_offset_px
-        # skip glyphs that are outside paper horizontally to save work
-        if x + CHAR_WIDTH < PAPER_X or x > PAPER_X + PAPER_W:
+        if x + CHAR_WIDTH < paper_draw_x or x > paper_draw_x + PAPER_W:
             continue
         text_surf = font.render(g['char'], True, (0, 0, 0))
         tmp = pygame.Surface(text_surf.get_size(), pygame.SRCALPHA)
@@ -363,14 +423,15 @@ def draw():
             tmp.blit(ghost, (ox, oy))
         screen.blit(tmp, (x, y))
 
-    # draw carriage tick at fixed center X (short vertical tick for visible cursor row)
+    # draw carriage underline at fixed center X
     cursor_vis = cursor_row - paper_scroll
     if 0 <= cursor_vis < visible_rows:
         line_top = PAPER_Y + cursor_vis * LINE_HEIGHT + paper_scroll_offset_px
-        tick_h = int(LINE_HEIGHT * 0.6)
-        tick_top = int(line_top + (LINE_HEIGHT - tick_h) / 2)
-        tick_bottom = tick_top + tick_h
-        pygame.draw.line(screen, (90,20,20), (CARRIAGE_DISPLAY_X, tick_top), (CARRIAGE_DISPLAY_X, tick_bottom), 3)
+        underline_y = line_top + LINE_HEIGHT - 10  # 3 px above the bottom of the line
+        underline_half_width = CHAR_WIDTH // 2
+        start_x = CARRIAGE_DISPLAY_X - underline_half_width + 7
+        end_x = CARRIAGE_DISPLAY_X + underline_half_width + 5
+        pygame.draw.line(screen, (220, 20, 20), (start_x, underline_y), (end_x, underline_y), 2)
 
     # command bar
     pygame.draw.rect(screen, (45,45,45), (0, COMMAND_BAR_Y, W, COMMAND_BAR_H))
@@ -397,7 +458,7 @@ def draw():
         label = ui_font.render("Key down: " + (locked_char_display or ""), True, (220,220,220))
         screen.blit(label, (x + 8, COMMAND_BAR_Y + 40))
 
-# ---------- text helpers, dialogs & actions ----------
+# ---------- document/text helpers & actions ----------
 def build_text_from_glyphs():
     if not glyphs:
         max_row = max(0, cursor_row)
@@ -408,7 +469,8 @@ def build_text_from_glyphs():
         row_chars = [" "] * cols_per_line
         for g in glyphs:
             if g['row'] == r:
-                row_chars[g['col']] = g['char']
+                if 0 <= g['col'] < cols_per_line:
+                    row_chars[g['col']] = g['char']
         line = "".join(row_chars).rstrip()
         lines.append(line)
     return "\n".join(lines)
@@ -421,6 +483,10 @@ def load_text_into_glyphs(text):
         for c, ch in enumerate(line):
             if c >= cols_per_line:
                 break
+            # convert tabs and other non-space whitespace to a simple space
+            if ch.isspace():
+                ch = ' '
+
             glyphs.append({'char': ch, 'row': r, 'col': c, 'offset_x': random.randint(-1,1), 'offset_y': random.randint(-1,1), 'darkness': random.uniform(0.75, 1.0)})
     cursor_row = len(lines) - 1 if lines else 0
     cursor_col = len(lines[-1]) if lines else 0
@@ -428,8 +494,7 @@ def load_text_into_glyphs(text):
         cursor_col = MAX_COL
     paper_scroll = max(0, cursor_row - visible_rows + 1)
     bell_rung_rows = set()
-    # reset view offset to center cursor_col
-    view_offset_px = CARRIAGE_DISPLAY_X - (PAPER_X + LEFT_MARGIN) - cursor_col * CHAR_WIDTH
+    view_offset_px = CARRIAGE_DISPLAY_X - PAPER_X - pixel_for_col(cursor_col)
 
 def ask_save_text_and_write(default_ext=".txt"):
     root = tk.Tk(); root.withdraw()
@@ -478,8 +543,7 @@ def action_clear():
     cursor_row = 0
     paper_scroll = 0
     bell_rung_rows.clear()
-    # center view on first column
-    view_offset_px = CARRIAGE_DISPLAY_X - (PAPER_X + LEFT_MARGIN) - cursor_col * CHAR_WIDTH
+    view_offset_px = CARRIAGE_DISPLAY_X - PAPER_X - pixel_for_col(cursor_col)
 
 def action_new_page():
     global glyphs, cursor_col, cursor_row, paper_scroll, saved_pages, bell_rung_rows, view_offset_px
@@ -489,7 +553,7 @@ def action_new_page():
     cursor_row = 0
     paper_scroll = 0
     bell_rung_rows.clear()
-    view_offset_px = CARRIAGE_DISPLAY_X - (PAPER_X + LEFT_MARGIN) - cursor_col * CHAR_WIDTH
+    view_offset_px = CARRIAGE_DISPLAY_X - PAPER_X - pixel_for_col(cursor_col)
 
 def action_save_as():
     fname = ask_save_text_and_write()
@@ -509,10 +573,11 @@ def action_export_png():
         pygame.draw.line(surf, (230,230,220), (10, y), (PAPER_W - 10, y), 1)
     min_row = paper_scroll
     max_row = paper_scroll + visible_rows - 1
+    base_x = LEFT_MARGIN + int(view_offset_px)
     for g in glyphs:
         if g['row'] < min_row or g['row'] > max_row:
             continue
-        x = LEFT_MARGIN + (g['col'] * CHAR_WIDTH) + int(view_offset_px) + g.get('offset_x', 0)
+        x = base_x + (g['col'] * CHAR_WIDTH) + g.get('offset_x', 0)
         y = (g['row'] - paper_scroll) * LINE_HEIGHT + g.get('offset_y', 0) + int(paper_scroll_offset_px)
         txt = font.render(g['char'], True, (0,0,0))
         tmp = pygame.Surface(txt.get_size(), pygame.SRCALPHA)
@@ -546,22 +611,112 @@ action_map = {
     "quit": action_quit
 }
 
-# ---------- initialize view offset so cursor_col is centered ----------
-view_offset_px = CARRIAGE_DISPLAY_X - (PAPER_X + LEFT_MARGIN) - cursor_col * CHAR_WIDTH
+# initialize view offset so initial cursor is centered
+view_offset_px = CARRIAGE_DISPLAY_X - PAPER_X - pixel_for_col(cursor_col)
 
-# ---------- main loop ----------
+# ---------- helper that performs the action when a pending key is released ----------
+def perform_key_action_from_event(pd):
+    global cursor_col, cursor_row, paper_scroll, view_offset_px
+
+    k = pd.key
+    ch = pd.unicode
+
+    # LEFT key: move left
+    if k == pygame.K_LEFT:
+        if cursor_col > 0:
+            cursor_col -= 1
+            animate_view_to_col_blocky(cursor_col, steps=3, step_ms=10)
+        return
+
+    # RIGHT key: move right
+    if k == pygame.K_RIGHT:
+        if cursor_col < OFF_COL:
+            cursor_col += 1
+            if cursor_col == OFF_COL:
+                animate_view_to_col_blocky(OFF_COL, steps=4, step_ms=36, play_thunk_at_end=True, thunk_delay_ms=8)
+            else:
+                animate_view_to_col_blocky(cursor_col, steps=3, step_ms=10)
+        return
+
+    # BACKSPACE
+    if k == pygame.K_BACKSPACE:
+        if cursor_col == OFF_COL:
+            animate_view_to_col_blocky(MAX_COL, steps=3, step_ms=10)
+            cursor_col = MAX_COL
+        elif cursor_col > 0:
+            if authentic_mode:
+                cursor_col -= 1
+                animate_view_to_col_blocky(cursor_col, steps=3, step_ms=10)
+            else:
+                remove_col = cursor_col - 1
+                # remove ALL glyphs at this (row, col) to fully clear the cell
+                new_glyphs = [gg for gg in glyphs if not (gg['row'] == cursor_row and gg['col'] == remove_col)]
+                removed = len(new_glyphs) != len(glyphs)
+                glyphs[:] = new_glyphs  # update in-place
+                # move left (whether or not anything was removed)
+                cursor_col = max(0, cursor_col - 1)
+                animate_view_to_col_blocky(cursor_col, steps=3, step_ms=36)
+        return
+
+    # RETURN / ENTER: snap vertically, then smooth horizontal slide
+    if k == pygame.K_RETURN:
+        # snap down to next line (immediate)
+        cursor_distance = cursor_col # Used for calculating animation duration
+        cursor_row += 1
+        cursor_col = 0
+
+        # if we've moved past visible area, snap the paper_scroll immediately
+        if cursor_row >= paper_scroll + visible_rows:
+            paper_scroll = cursor_row - visible_rows + 1
+            paper_scroll_offset_px = 0.0
+
+        # redraw once so the vertical snap is visible immediately
+        draw()
+        pygame.display.flip()
+
+        # then smoothly slide the page so column 0 lines up under the carriage
+        print(cursor_col)
+        animate_view_to_col_smooth(0, duration_ms=cursor_distance * 25)
+
+        # if the new cursor_row is beyond visible area (already snapped), optionally animate vertical feed
+        # (we used snap behavior per your request; if you'd rather animate vertical feed, call animate_paper_scroll_to instead)
+        return
+
+    # Printable: for printable keys, the glyph was already appended on KEYDOWN with pending=True.
+    # Here we finalize that glyph (clear pending flag), then advance cursor_col and animate view.
+    if ch and len(ch) == 1 and k not in MODIFIER_KEYS:
+        # find the last pending glyph (should exist)
+        for i in range(len(glyphs)-1, -1, -1):
+            g = glyphs[i]
+            if g.get('pending', False) and g['row'] == cursor_row:
+                # finalize it
+                g['pending'] = False
+                break
+        # Now advance cursor_col and animate (do not re-play strike here; it already played on KEYDOWN)
+        if cursor_col >= MAX_COL:
+            # move off-paper
+            cursor_col = OFF_COL
+            animate_view_to_col_blocky(OFF_COL, steps=4, step_ms=10, play_thunk_at_end=True, thunk_delay_ms=8)
+        else:
+            cursor_col += 1
+            animate_view_to_col_blocky(cursor_col, steps=3, step_ms=10)
+        return
+
+# ---------- main event loop ----------
+COMMAND_BAR_H = 96
+COMMAND_BAR_Y = H - COMMAND_BAR_H
+
 running = True
-
 while running:
     for ev in pygame.event.get():
         if ev.type == pygame.QUIT:
             running = False
 
-        # if animating, animation functions buffer events; ignore further handling here
+        # animations buffer and repost events internally; ignore processing here while animating
         if animating:
             continue
 
-        # Mouse clicks -> command buttons
+        # mouse -> command bar
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             mx, my = ev.pos
             if my >= COMMAND_BAR_Y:
@@ -573,13 +728,30 @@ while running:
                         break
                 continue
 
+        # KEYDOWN: for printable keys, draw + strike now; for others, lock pending and wait for KEYUP to act
         if ev.type == pygame.KEYDOWN:
+            # Special-case: if the carriage is off-paper, allow movement/backspace/return immediately
+            if ev.key in (pygame.K_BACKSPACE, pygame.K_RETURN, pygame.K_LEFT, pygame.K_RIGHT) and cursor_col == OFF_COL:
+                # perform immediately (bypass pending lock) so user can come back from off-paper
+                # We call the same handler used on KEYUP to keep behavior consistent.
+                # Temporarily set a lock indicator for UX, perform action, then clear lock.
+                key_locked = True
+                locked_key = ev.key
+                locked_char_display = pygame.key.name(ev.key)
+                # call the same function that performs actions on KEYUP (use the event directly)
+                perform_key_action_from_event(ev)
+                # release lock (perform_key_action_from_event does animations)
+                key_locked = False
+                locked_key = None
+                locked_char_display = ""
+                continue
+
             # quit
             if ev.key == pygame.K_ESCAPE:
                 running = False
                 continue
 
-            # Up/Down arrows: move view only (scroll up/down)
+            # Up/Down: immediate view-only
             if ev.key == pygame.K_UP:
                 target = max(0, paper_scroll - 1)
                 if target != paper_scroll:
@@ -593,130 +765,130 @@ while running:
                     animate_paper_scroll_to(target, duration_ms=180)
                 continue
 
-            # treat modifier keys as not locking (so Shift works)
             if ev.key in MODIFIER_KEYS:
                 continue
 
-            # Left/Right move the logical cursor and animate the view offset (page moves)
-            if ev.key in (pygame.K_LEFT, pygame.K_RIGHT):
-                if key_locked:
-                    continue
-                key_locked = True
-                locked_key = ev.key
-                locked_char_display = pygame.key.name(ev.key)
-                if ev.key == pygame.K_LEFT:
-                    if cursor_col > 0:
-                        play_key()
-                        cursor_col -= 1
-                        animate_view_to_col(cursor_col, duration_ms=120)
-                else:
-                    if cursor_col < OFF_COL:
-                        play_key()
-                        cursor_col += 1
-                        if cursor_col == OFF_COL:
-                            animate_view_to_col(OFF_COL, duration_ms=200, play_thunk_at_end=True, thunk_delay_ms=10)
-                        else:
-                            animate_view_to_col(cursor_col, duration_ms=120)
+            # If a key is already locked, ignore
+            if key_locked:
                 continue
 
-            # Backspace behavior
-            if ev.key == pygame.K_BACKSPACE:
-                if key_locked:
-                    continue
-                key_locked = True
-                locked_key = ev.key
-                locked_char_display = "BS"
-                if cursor_col == OFF_COL:
-                    play_key()
-                    animate_view_to_col(MAX_COL, duration_ms=140)
-                    cursor_col = MAX_COL
-                elif cursor_col > 0:
-                    if authentic_mode:
-                        play_key()
-                        cursor_col -= 1
-                        animate_view_to_col(cursor_col, duration_ms=120)
-                    else:
-                        remove_col = cursor_col - 1
-                        removed = False
-                        for i in range(len(glyphs)-1, -1, -1):
-                            g = glyphs[i]
-                            if g['row'] == cursor_row and g['col'] == remove_col:
-                                glyphs.pop(i)
-                                removed = True
-                                break
-                        if removed:
-                            cursor_col -= 1
-                            animate_view_to_col(cursor_col, duration_ms=100)
-                        else:
-                            cursor_col -= 1
-                            animate_view_to_col(cursor_col, duration_ms=100)
-                continue
-
-            # Enter: carriage return (vertical move)
-            if ev.key == pygame.K_RETURN:
-                if key_locked:
-                    continue
-                key_locked = True
-                locked_key = ev.key
-                locked_char_display = "RET"
-                play_key()
-                # center view on column 0 after return
-                animate_view_to_col(0, duration_ms=300)
-                cursor_col = 0
-                cursor_row += 1
-                if cursor_row >= paper_scroll + visible_rows:
-                    animate_paper_scroll_to(cursor_row - visible_rows + 1, duration_ms=260)
-                continue
-
-            # Printable characters / typing
+            # Printable character: draw immediately and play strike, but do NOT advance cursor or move view until KEYUP.
             if ev.unicode and len(ev.unicode) == 1 and ev.key not in MODIFIER_KEYS:
-                if key_locked:
-                    continue
-                key_locked = True
-                locked_key = ev.key
-                ch = ev.unicode
-                locked_char_display = ch
+                # if off-paper, ignore (no strike)
                 if cursor_col == OFF_COL:
                     continue
-                # typing into last printable column causes overstrike then slide off
+
+                # normalize whitespace characters so the font doesn't get a control char
+                raw_ch = ev.unicode
+
+                # Handle tabs
+                if raw_ch == '\t':
+                    # Compute spaces needed to next tab stop
+                    spaces_needed = TAB_SIZE - (cursor_col % TAB_SIZE)
+                    for _ in range(spaces_needed):
+                        if cursor_col >= MAX_COL:
+                            break  # stop if we run out of room in line
+                        strikes = count_strikes_at(cursor_row, cursor_col)
+                        base_darkness = random.uniform(0.6, 0.95)
+                        darkness = min(1.0, base_darkness + 0.12 * strikes)
+                        jitter_x = random.uniform(-0.5, 0.5)
+                        jitter_y = random.uniform(-0.5, 0.5)
+                        glyphs.append({
+                            'char': ' ',
+                            'row': cursor_row,
+                            'col': cursor_col,
+                            'offset_x': jitter_x,
+                            'offset_y': jitter_y,
+                            'darkness': darkness,
+                            'pending': True
+                        })
+                        cursor_col += 1
+                    continue
+
+                # if it's a tab or other whitespace, turn it into a space character.
+                if raw_ch.isspace():
+                    ch_to_draw = ' '
+                else:
+                    ch_to_draw = raw_ch
+
+                # Lock and store pending event
+                key_locked = True
+                locked_key = ev.key
+                pending_keydown = ev
+                if ev.unicode.isprintable():
+                    locked_char_display = ev.unicode
+                else:
+                    locked_char_display = pygame.key.name(ev.key)
+
+                # compute strike properties at current column
                 if cursor_col >= MAX_COL:
                     strikes = count_strikes_at(cursor_row, MAX_COL)
                     if cursor_row not in bell_rung_rows:
+                        # ring bell on first contact
                         play_bell()
                         bell_rung_rows.add(cursor_row)
-                    play_key()
-                    base_dark = random.uniform(0.6, 0.95)
-                    darkness = min(1.0, base_dark + 0.12 * strikes)
-                    jitter_x = random.randint(-2, 2) if strikes > 0 else random.randint(-1, 1)
-                    jitter_y = random.randint(-2, 2) if strikes > 0 else random.randint(-1, 2)
-                    glyphs.append({'char': ch, 'row': cursor_row, 'col': MAX_COL, 'offset_x': jitter_x, 'offset_y': jitter_y, 'darkness': darkness})
-                    cursor_col = OFF_COL
-                    animate_view_to_col(OFF_COL, duration_ms=240, play_thunk_at_end=True, thunk_delay_ms=10)
                 else:
                     strikes = count_strikes_at(cursor_row, cursor_col)
                     if cursor_col >= cols_per_line - 2 and cursor_row not in bell_rung_rows:
                         play_bell()
                         bell_rung_rows.add(cursor_row)
-                    play_key()
-                    base_dark = random.uniform(0.6, 0.95)
-                    darkness = min(1.0, base_dark + 0.12 * strikes)
-                    jitter_x = random.randint(-1, 1)
-                    jitter_y = random.randint(-1, 2)
-                    glyphs.append({'char': ch, 'row': cursor_row, 'col': cursor_col, 'offset_x': jitter_x, 'offset_y': jitter_y, 'darkness': darkness})
-                    cursor_col += 1
-                    animate_view_to_col(cursor_col, duration_ms=110)
+
+                # play strike now (on KEYDOWN)
+                play_key()
+
+                # append glyph with pending=True so KEYUP can finalize & advance
+                base_dark = random.uniform(0.6, 0.95)
+                darkness = min(1.0, base_dark + 0.12 * strikes)
+                if cursor_col >= MAX_COL:
+                    jitter_x = random.randint(-2, 2) if strikes > 0 else random.randint(-1, 1)
+                    jitter_y = random.randint(-2, 2) if strikes > 0 else random.randint(-1, 2)
+                    col_for_glyph = MAX_COL
+                else:
+                    jitter_x = random.uniform(-0.5, 0.5)
+                    jitter_y = random.uniform(-0.5, 0.5)
+                    col_for_glyph = cursor_col
+
+                glyphs.append({
+                    'char': ch_to_draw,
+                    'row': cursor_row,
+                    'col': col_for_glyph,
+                    'offset_x': jitter_x,
+                    'offset_y': jitter_y,
+                    'darkness': darkness,
+                    'pending': True
+                })
+                # do NOT advance cursor_col or move view here
                 continue
 
-        # KEYUP: release lock if same key
+            # Non-printable keys: accept as pending (lock) and wait for KEYUP to act
+            # (Left/Right/Backspace/Return)
+            key_locked = True
+            locked_key = ev.key
+            pending_keydown = ev
+            if ev.unicode and len(ev.unicode) == 1 and ev.unicode.isprintable():
+                locked_char_display = ev.unicode
+            else:
+                locked_char_display = pygame.key.name(ev.key)
+            # don't perform the action yet
+            continue
+
+        # KEYUP: if it's the same locked key, perform its action now
         if ev.type == pygame.KEYUP:
             if ev.key in MODIFIER_KEYS:
                 continue
-            if key_locked and ev.key == locked_key:
+            if key_locked and ev.key == locked_key and pending_keydown is not None:
+                pd = pending_keydown
+                pending_keydown = None
+                # perform the action (this will do animations and play sounds for non-printables;
+                # printable case will not replay the strike sound because we already did on KEYDOWN)
+                perform_key_action_from_event(pd)
+                # release lock after action finishes
                 key_locked = False
                 locked_key = None
                 locked_char_display = ""
+            # otherwise ignore unmatched keyup
+            continue
 
-    # draw & flip
     draw()
     pygame.display.flip()
     clock.tick(60)
